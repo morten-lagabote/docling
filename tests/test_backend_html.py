@@ -1059,6 +1059,61 @@ def test_list_item_without_text():
     assert "3. Third." in doc.export_to_markdown()
 
 
+def test_list_item_text_after_nested_block():
+    """Regression for #4422: text after a nested list or table in a list item
+    follows the nested block, instead of being merged into the list item text.
+    """
+    html = (
+        b"<html><body><ol>"
+        b"<li><p>Intro:</p><ol><li>Nested.</li></ol><p>After the list.</p></li>"
+        b"<li>Table:<table><tbody><tr><td>A</td></tr></tbody></table>"
+        b"After the table.</li>"
+        b"<li>Task:<ul><li>Nested.</li></ul><input type='checkbox' checked>Done.</li>"
+        b"<li><table><tbody><tr><td>B</td></tr></tbody></table><p>Only after.</p></li>"
+        b"</ol><dl><dt>Term</dt>"
+        b"<dd>Definition:<ul><li>Nested.</li></ul>After the definition.</dd>"
+        b"</dl></body></html>"
+    )
+    in_doc = InputDocument(
+        path_or_stream=BytesIO(html),
+        format=InputFormat.HTML,
+        backend=HTMLDocumentBackend,
+        filename="test",
+    )
+    backend = HTMLDocumentBackend(in_doc=in_doc, path_or_stream=BytesIO(html))
+    doc: DoclingDocument = backend.convert()
+    texts = {item.text: item for item in doc.texts}
+
+    for item_text, after_text in [
+        ("Intro:", "After the list."),
+        ("Table:", "After the table."),
+        ("Definition:", "After the definition."),
+    ]:
+        list_item = texts[item_text]
+        assert list_item.children[-1].cref == texts[after_text].self_ref
+
+    # Text that only follows the nested block stays after it: the list item has
+    # no text of its own.
+    only_after = texts["Only after."]
+    host_item = only_after.parent.resolve(doc)
+    assert host_item.label == DocItemLabel.LIST_ITEM
+    assert host_item.text == ""
+    assert [child.cref for child in host_item.children] == [
+        doc.tables[1].self_ref,
+        only_after.self_ref,
+    ]
+
+    # A checkbox after the nested block is emitted once, in DOM order.
+    checkboxes = [
+        item for item in doc.texts if item.label == DocItemLabel.CHECKBOX_SELECTED
+    ]
+    assert len(checkboxes) == 1
+    assert [child.cref for child in texts["Task:"].children][1:] == [
+        checkboxes[0].self_ref,
+        texts["Done."].self_ref,
+    ]
+
+
 @pytest.mark.parametrize(
     "inner",
     [

@@ -206,6 +206,9 @@ _IMPLIED_END_TAGS: Final = {
 
 _CODE_TAG_SET: Final = {"code", "kbd", "samp"}
 
+# Blocks nested in a list item that are not part of the list item text
+_NESTED_BLOCK_TAGS: Final = ["ul", "ol", "dl", "table"]
+
 _FORMAT_TAG_MAP: Final = {
     "b": {"bold": True},
     "strong": {"bold": True},
@@ -2426,6 +2429,7 @@ class HTMLDocumentBackend(DeclarativeDocumentBackend):
         ignore_list=False,
         find_parent_annotation=False,
         keep_newlines=False,
+        nodes: Optional[list[PageElement]] = None,
     ) -> AnnotatedTextList:
         result: AnnotatedTextList = AnnotatedTextList()
 
@@ -2440,7 +2444,7 @@ class HTMLDocumentBackend(DeclarativeDocumentBackend):
                     with self._use_format(format_tags):
                         with self._use_hyperlink(this_parent):
                             return self._extract_text_and_hyperlink_recursively(
-                                item, ignore_list
+                                item, ignore_list, nodes=nodes
                             )
                 this_parent = this_parent.parent
 
@@ -2499,8 +2503,8 @@ class HTMLDocumentBackend(DeclarativeDocumentBackend):
             return AnnotatedTextList()
         if self._is_checkbox_label_tag(tag):
             return AnnotatedTextList()
-        if not ignore_list or (tag.name not in ["ul", "ol", "dl", "table"]):
-            for child in tag:
+        if not ignore_list or (tag.name not in _NESTED_BLOCK_TAGS):
+            for child in tag if nodes is None else nodes:
                 if isinstance(child, Tag) and child.name in _FORMAT_TAG_MAP:
                     with self._use_format([child.name]):
                         result.extend(
@@ -2878,6 +2882,7 @@ class HTMLDocumentBackend(DeclarativeDocumentBackend):
         li: Tag,
         doc: DoclingDocument,
         processed_elements: set,
+        text_nodes: Optional[list[PageElement]] = None,
     ) -> None:
         """Process nested content (images, lists, etc.) within a list item in DOM order.
 
@@ -2885,9 +2890,43 @@ class HTMLDocumentBackend(DeclarativeDocumentBackend):
             li: The list item tag
             doc: The DoclingDocument being built
             processed_elements: Set of element IDs already processed to avoid duplicates
+            text_nodes: The children holding the list item text, see
+                `_list_item_text_nodes`. Computed if not given.
         """
-        for child in li.children:
+        if text_nodes is None:
+            text_nodes = self._list_item_text_nodes(li)
+        for child in text_nodes:
             self._process_nested_element(child, li, doc, processed_elements)
+        # The content after the list item text keeps its DOM order
+        self._walk_nodes(li, li.contents[len(text_nodes) :], doc)
+
+    def _list_item_text_nodes(self, tag: Tag) -> list[PageElement]:
+        """Return the children of a list item that hold the list item text.
+
+        These are the children before the first nested block (list or table), so
+        that the content after the block is not merged into the list item text.
+        They hold no text if the text of the list item only follows the block.
+        If the list item has no text outside its nested blocks, all the children
+        are returned.
+        """
+        for index, child in enumerate(tag.contents):
+            if isinstance(child, Tag) and (
+                child.name in _NESTED_BLOCK_TAGS or child.find(_NESTED_BLOCK_TAGS)
+            ):
+                parts = self._extract_text_and_hyperlink_recursively(
+                    tag, ignore_list=True
+                )
+                if "".join(part.text for part in parts).strip():
+                    return tag.contents[:index]
+                break
+        return tag.contents
+
+    @staticmethod
+    def _is_in_nodes(node: PageElement, parent: Tag, nodes: list[PageElement]) -> bool:
+        """Check whether `node` is one of the children `nodes` of `parent` or inside one."""
+        while node.parent is not None and node.parent is not parent:
+            node = node.parent
+        return any(node is candidate for candidate in nodes)
 
     def _add_list_item_with_content(
         self,
@@ -2897,15 +2936,20 @@ class HTMLDocumentBackend(DeclarativeDocumentBackend):
         enumerated: bool = False,
         marker: str = "",
         extra_formatting: Optional[Formatting] = None,
+        text_nodes: Optional[list[PageElement]] = None,
     ) -> Optional[RefItem]:
         """Helper method to add a list item with its content.
 
         Handles both simple and complex content with inline groups.
         Returns the created list item or None if no content.
+        `text_nodes` are the children holding the list item text, see
+        `_list_item_text_nodes`; they are computed if not given.
         """
         # Extract text and hyperlinks
+        if text_nodes is None:
+            text_nodes = self._list_item_text_nodes(tag)
         parts = self._extract_text_and_hyperlink_recursively(
-            tag, ignore_list=True, find_parent_annotation=True
+            tag, ignore_list=True, find_parent_annotation=True, nodes=text_nodes
         )
         min_parts = parts.simplify_text_elements()
         item_text = re.sub(
@@ -3212,11 +3256,14 @@ class HTMLDocumentBackend(DeclarativeDocumentBackend):
                     else ""
                 )
 
-                # 2) Find inputs and checkboxes in this <li>
+                # 2) Find inputs and checkboxes in the list item text. Those after
+                #    a nested block are emitted in DOM order with the other content.
+                text_nodes = self._list_item_text_nodes(li)
                 inputs_in_li = [
                     input_tag
                     for input_tag in li.find_all("input")
                     if input_tag.find_parent("li") is li
+                    and self._is_in_nodes(input_tag, li, text_nodes)
                 ]
                 custom_checkboxes_in_li = [
                     checkbox_tag
@@ -3226,6 +3273,7 @@ class HTMLDocumentBackend(DeclarativeDocumentBackend):
                         )
                     )
                     if checkbox_tag.find_parent("li") is li
+                    and self._is_in_nodes(checkbox_tag, li, text_nodes)
                 ]
 
                 # GFM task-list form: the whole <li> is a bare checkbox input
@@ -3246,12 +3294,17 @@ class HTMLDocumentBackend(DeclarativeDocumentBackend):
                         parent=list_group,
                         enumerated=is_ordered,
                         marker=marker,
+                        text_nodes=text_nodes,
                     )
-                    if list_item is None and any(
-                        not self._has_list_ancestor(elem, li)
-                        for elem in li.find_all(["table", "img"])
+                    if list_item is None and (
+                        len(text_nodes) < len(li.contents)
+                        or any(
+                            not self._has_list_ancestor(elem, li)
+                            for elem in li.find_all(["table", "img"])
+                        )
                     ):
-                        # An item without text still holds its table or image
+                        # An item without text of its own still holds the text
+                        # after its nested block, or its table or image
                         list_item = doc.add_list_item(
                             text="",
                             enumerated=is_ordered,
@@ -3284,7 +3337,7 @@ class HTMLDocumentBackend(DeclarativeDocumentBackend):
                         # 4) Process nested content (images, lists, etc.) in DOM order
                         processed_elements = set()
                         self._process_list_item_nested_content(
-                            li, doc, processed_elements
+                            li, doc, processed_elements, text_nodes
                         )
                 else:
                     # No content, but check for nested lists (including those wrapped in divs)
