@@ -813,6 +813,12 @@ class MarkdownDocumentBackend(DeclarativeDocumentBackend):
                     _ListItemCreationPayload(enumerated=enumerated, marker=marker)
                 )
 
+        elif isinstance(element, marko.block.Quote):
+            _log.debug(" - Quote")
+            parent_item = doc.add_group(
+                label=GroupLabel.BLOCK_QUOTE, name="blockquote", parent=parent_item
+            )
+
         elif isinstance(element, marko.inline.Image):
             _log.debug(" - Image with alt: %s, url: %s", element.title, element.dest)
 
@@ -1024,7 +1030,7 @@ class MarkdownDocumentBackend(DeclarativeDocumentBackend):
             for child in element.children:
                 if (
                     isinstance(element, marko.block.ListItem)
-                    and isinstance(child, marko.block.List)
+                    and isinstance(child, marko.block.List | marko.block.Quote)
                     and parent_item
                     and list_last_item_by_ref.get(parent_item.self_ref, None)
                 ):
@@ -1048,6 +1054,13 @@ class MarkdownDocumentBackend(DeclarativeDocumentBackend):
                     formatting=formatting,
                     hyperlink=hyperlink,
                 )
+
+        if (
+            isinstance(element, marko.block.Quote)
+            and parent_item is not None
+            and not parent_item.children
+        ):
+            doc.delete_items(node_items=[parent_item])
 
     def _get_image_loader(self) -> ImageResourceLoader:
         """Lazily build the shared image-resource loader.

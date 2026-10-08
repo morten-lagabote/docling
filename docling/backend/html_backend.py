@@ -135,6 +135,7 @@ _TEXT_BLOCK_TAGS: Final = {"p", "li", "th", "td"}
 # Tags that initiate distinct Docling items
 _BLOCK_TAGS: Final = {
     "address",
+    "blockquote",
     "details",
     "dl",
     "figure",
@@ -2462,7 +2463,9 @@ class HTMLDocumentBackend(DeclarativeDocumentBackend):
             return AnnotatedTextList()
         if self._is_checkbox_label_tag(tag):
             return AnnotatedTextList()
-        if not ignore_list or (tag.name not in ["ul", "ol", "dl", "table"]):
+        if not ignore_list or (
+            tag.name not in ["ul", "ol", "dl", "table", "blockquote"]
+        ):
             for child in tag:
                 if isinstance(child, Tag) and child.name in _FORMAT_TAG_MAP:
                     with self._use_format([child.name]):
@@ -2823,9 +2826,10 @@ class HTMLDocumentBackend(DeclarativeDocumentBackend):
                 if not self._has_list_ancestor(elem, li):
                     self._handle_block(elem, doc)
                     self.parents[self.level + 1] = None
-            elif elem.name == "table":
-                # Dispatch nested tables to the block handler so they are parsed
-                # as tables instead of being flattened into the list item text.
+            elif elem.name in {"table", "blockquote"}:
+                # Dispatch nested tables and block quotes to the block handler so
+                # they are parsed as such instead of being flattened into the list
+                # item text.
                 # No _has_list_ancestor-style guard is needed here (unlike the
                 # list branch): _handle_block consumes the whole table, so its
                 # descendants are never re-walked by _process_nested_element.
@@ -3212,9 +3216,9 @@ class HTMLDocumentBackend(DeclarativeDocumentBackend):
                     )
                     if list_item is None and any(
                         not self._has_list_ancestor(elem, li)
-                        for elem in li.find_all(["table", "img"])
+                        for elem in li.find_all(["table", "img", "blockquote"])
                     ):
-                        # An item without text still holds its table or image
+                        # An item without text still holds its table, image or quote
                         list_item = doc.add_list_item(
                             text="",
                             enumerated=is_ordered,
@@ -3491,6 +3495,23 @@ class HTMLDocumentBackend(DeclarativeDocumentBackend):
         elif tag_name == "details":
             with self._use_details(tag, doc):
                 self._walk(tag, doc)
+
+        elif tag_name == "blockquote":
+            # A heading in the quote moves the hierarchy level, so restore it.
+            with self._use_table_cell_context():
+                quote = doc.add_group(
+                    name=tag_name,
+                    label=GroupLabel.BLOCK_QUOTE,
+                    parent=self.parents[self.level],
+                    content_layer=self.content_layer,
+                )
+                self.parents[self.level + 1] = quote
+                self.level += 1
+                self._walk(tag, doc)
+            if quote.children:
+                added_refs.append(quote.get_ref())
+            else:
+                doc.delete_items(node_items=[quote])
         return added_refs
 
     @staticmethod
